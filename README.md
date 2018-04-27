@@ -13,7 +13,7 @@ PREREQUISITES
 
 Your Tado Devices fully operational (and connected to wifi)
 Your Tado credentials (username/password)
-Access to Hubitat (e.g. http://portal.hubitat/)
+Access to Hubitat (e.g. http://portal.hubitat.com/)
 
 You need to update from Repo the Tado Connect Smart app and the four Device Types.
 
