@@ -12,6 +12,7 @@
  *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
  *  for the specific language governing permissions and limitations under the License.
  *
+ * 27/04/2018 v2.8 fixed issue with null values when trying to retrieve current setpoint when null as the try and catch arent working as expected.
  * 27/04/2018 v2.7 Modified for Hubitat
  * 07/02/2018 v2.7 Added some new try catch blocks around parse capability as there were exceptioons after v2.1 occuring for air conditioners, this now works correctly
  * 06/02/2018 v2.6 Fixed Commands for those with Heat Cool that do not support Fan Modes
@@ -1323,11 +1324,14 @@ def autoCommand(childDevice){
   if(deviceType == "HEATING")
   {
     def initialsetpointtemp
-    try {
-      traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    if(childDevice.device.currentValue("thermostatSetpoint"))
+    {
+        traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
     }
-    catch (NumberFormatException e){
-        traperror = 0
+    else
+    {
+       log.debug "Existing Setpoint is not set"
+       traperror = 0 
     }
     if(traperror == 0){
       initialsetpointtemp = settings.defHeatingTemp
@@ -1345,11 +1349,15 @@ def autoCommand(childDevice){
     def jsonbody
     def capabilitySupportsWaterTempControl = parseCapabilityData(childDevice.getCapabilitySupportsWaterTempControl())
     if(capabilitySupportsWaterTempControl == "true"){
-      try {
+    if(childDevice.device.currentValue("thermostatSetpoint"))
+    {
         traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-      }catch (NumberFormatException e){
-        traperror = 0
-      }
+    }
+    else
+    {
+       log.debug "Existing Setpoint is not set"
+       traperror = 0 
+    }
       if(traperror == 0){
         initialsetpointtemp = settings.defHeatingTemp
       } else {
@@ -1848,14 +1856,15 @@ def heatCommand(childDevice){
       def capabilitySupportsHeatAutoFanSpeed = parseCapabilityData(childDevice.getCapabilitySupportsHeatAutoFanSpeed())
       def capabilitySupportsHeatFanSpeed = parseCapabilityData(childDevice.getCapabilitySupportsHeatFanSpeed())
       def fancapabilitysupported = capabilitySupportsHeatAutoFanSpeed
-      try
-      {
-        traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-      }
-      catch (NumberFormatException e)
-      {
-        traperror = 0
-      }
+      if(childDevice.device.currentValue("thermostatSetpoint"))
+    	{
+        	traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    	}
+    	else
+    	{
+       		log.debug "Existing Setpoint is not set"
+       		traperror = 0 
+    	}
       if (fancapabilitysupported == "true")
       {
         supportedfanspeed = "AUTO"
@@ -1914,14 +1923,15 @@ def heatCommand(childDevice){
     {
       def initialsetpointtemp
       def traperror
-        try
-        {
-          traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-        }
-        catch (NumberFormatException e)
-        {
-          traperror = 0
-        }
+      if(childDevice.device.currentValue("thermostatSetpoint"))
+    	{
+        	traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    	}
+    	else
+    	{
+       		log.debug "Existing Setpoint is not set"
+       		traperror = 0 
+    	}
         if(traperror == 0)
         {
           initialsetpointtemp = settings.defHeatingTemp
@@ -1946,11 +1956,15 @@ def heatCommand(childDevice){
       def traperror
       def capabilitySupportsWaterTempControl = parseCapabilityData(childDevice.getCapabilitySupportsWaterTempControl())
       if(capabilitySupportsWaterTempControl == "true"){
-        try {
-          traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-        }catch (NumberFormatException e){
-          traperror = 0
-        }
+        if(childDevice.device.currentValue("thermostatSetpoint"))
+    	{
+        	traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    	}
+    	else
+    	{
+       		log.debug "Existing Setpoint is not set"
+       		traperror = 0 
+    	}
         if(traperror == 0){
           initialsetpointtemp = settings.defHeatingTemp
         } else {
@@ -1984,13 +1998,14 @@ def emergencyHeat(childDevice){
     def capabilitySupportsHeatAutoFanSpeed = parseCapabilityData(childDevice.getCapabilitySupportsHeatAutoFanSpeed())
     def capabilitySupportsHeatFanSpeed = parseCapabilityData(childDevice.getCapabilitySupportsHeatFanSpeed())
     def fancapabilitysupported = capabilitySupportsHeatAutoFanSpeed
-    try
+    if(childDevice.device.currentValue("thermostatSetpoint"))
     {
-      traperror = Integer.parseInt(childDevice.device.currentValue("thermostatSetpoint"))
+        traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
     }
-    catch (NumberFormatException e)
+    else
     {
-      traperror = 0
+       log.debug "Existing Setpoint is not set"
+       traperror = 0 
     }
     if (capabilitysupported == "true")
     {
@@ -2058,14 +2073,15 @@ def emergencyHeat(childDevice){
   if(deviceType == "HEATING")
   {
       def initialsetpointtemp
-      try
-      {
-        traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-      }
-      catch (NumberFormatException e)
-      {
-        traperror = 0
-      }
+      if(childDevice.device.currentValue("thermostatSetpoint"))
+    	{
+        	traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    	}
+    	else
+    	{
+       		log.debug "Existing Setpoint is not set"
+       		traperror = 0 
+    	}
       if(traperror == 0)
       {
         initialsetpointtemp = settings.defHeatingTemp
@@ -2090,14 +2106,15 @@ def emergencyHeat(childDevice){
     def jsonbody
     def capabilitySupportsWaterTempControl = parseCapabilityData(childDevice.getCapabilitySupportsWaterTempControl())
     if(capabilitySupportsWaterTempControl == "true"){
-      try
-      {
-        traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
-      }
-      catch (NumberFormatException e)
-      {
-        traperror = 0
-      }
+      if(childDevice.device.currentValue("thermostatSetpoint"))
+    	{
+        	traperror = ((childDevice.device.currentValue("thermostatSetpoint")).intValue())
+    	}
+    	else
+    	{
+       		log.debug "Existing Setpoint is not set"
+       		traperror = 0 
+    	}
       if(traperror == 0)
       {
         initialsetpointtemp = settings.defHeatingTemp
