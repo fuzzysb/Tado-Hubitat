@@ -12,6 +12,7 @@
  *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
  *  for the specific language governing permissions and limitations under the License.
  *
+ * 22/11/2023 v2.9 Adjusted to OAuth 2 authentication flow & update to logging process including toggle
  * 27/04/2018 v2.8 fixed issue with null values when trying to retrieve current setpoint when null as the try and catch arent working as expected.
  * 27/04/2018 v2.7 Modified for Hubitat
  * 07/02/2018 v2.7 Added some new try catch blocks around parse capability as there were exceptioons after v2.1 occuring for air conditioners, this now works correctly
@@ -26,7 +27,7 @@
  * 04/05/2017 v1.8 Corrected issue with scheduling which was introduced in v1.7 with merge of pull request. Many thanks to @Jnick for getting the logs to help diagnose this.
  * 17/04/2017 v1.7 General Bugfixes around Tado user presence with thanks to @sipuncher
  * 14/04/2017 v1.6 fixed defects in user presence device polling
- * 06/04/2017 v1.5 scheduled refresh of tado user status every minute (Thanks to @sipuncher for pointing out my mistake)
+ * 06/04/2017 v1.5 scheduled of tado user status every minute (Thanks to @sipuncher for pointing out my mistake)
  * 03/04/2017 v1.4 Added ability to have your Tado Users created as Smarthings Virtual Presence Sensors for use in routines etc..
  * 03/01/2017 v1.3 Corrected Cooling Commands and Set Points issue with incorrect DNI statement with thanks to Richard Gregg
  * 03/12/2016 v1.2 Corrected Values for Heating and Hot Water set Points
@@ -39,12 +40,22 @@ import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 
 private apiUrl() 			{ "https://my.tado.com" }
+private getApiUrl()		    { "https://my.tado.com" }
+private getOauthTokenUri()  { "https://auth.tado.com" }
+private getOauthTokenPath() { "/oauth/token" }
 private getVendorName() 	{ "Tado" }
 private getVendorIcon()		{ "https://dl.dropboxusercontent.com/s/fvjrqcy5xjxsr31/tado_128.png" }
-private getClientId() 		{ appSettings.clientId }
-private getClientSecret() 	{ appSettings.clientSecret }
-//private getServerUrl() 		{ if(!appSettings.serverUrl){return getApiServerUrl()} }
-private getServerUrl() 		{ return getApiServerUrl() }
+private getVendorAuthPath()	{ "/oauth2/authorize" }
+private getVendorTokenPath(){ "https://auth.tado.com/oauth/token" }
+private getClientId() 		{ settings.clientId }
+private getClientSecret() 	{ settings.clientSecret }
+
+private getRefreshToken()  { state.refreshToken }
+
+private getCallbackUrl()	{ getServerUrl()+ "/oauth/callback?access_token=${state.accessToken}" }
+private getBuildRedirectUrl() { getServerUrl() + "/oauth/initialize?access_token=${state.accessToken}" }
+private getServerUrl() 		{ return getFullApiServerUrl() }
+
  // Automatically generated. Make future change here.
 definition(
     name: "Tado (Connect)",
@@ -82,16 +93,45 @@ def startPage() {
 }
 
 def authPage() {
-	log.debug "In authPage"
-	def description = null
-	log.debug "Prompting for Auth Details."
-	description = "Tap to enter Credentials."
-	return dynamicPage(name: "Credentials", title: "Authorize Connection", nextPage:mainPage, uninstall: false , install:false) {
-	   section("Generate Username and Password") {
-				input "username", "text", title: "Your Tado Username", required: true
+    logDebug "In authPage"
+
+	def description
+	def uninstallAllowed = false
+	def oauthTokenProvided = false
+
+	if (!state.accessToken) {
+		logDebug "About to create access token."
+		state.accessToken = createAccessToken()
+		logDebug "Access token is : ${state.accessToken}"
+	}
+
+	def redirectUrl = getBuildRedirectUrl()
+	logDebug "Redirect url = ${redirectUrl}"
+
+	if (state.authToken) {
+		description = "Tap 'Next' to proceed"
+		uninstallAllowed = true
+		oauthTokenProvided = true
+	} else {
+		description = "Click to enter Credentials."
+	}
+
+	if (!oauthTokenProvided) {
+		logDebug "Showing the login page"
+		return dynamicPage(name: "Credentials", title: "Authorize Connection", nextPage:mainPage, uninstall: false , install:false) {
+			section("Enter Application Details...") {
+				paragraph "You can get clientID and clientSecret from Tado. These are used for the initial authtoken request."
+				input(name: 'clientId', title: 'Client ID', type: 'text', required: true)
+				input(name: 'clientSecret', title: 'Client secret (save this box before pressing the button below)', type: 'text', required: true, submitOnChange: true )
+			}
+			section("Generate Username and Password") {
+				input "username", "text", title: "Your Tado Username", required: true, defaultValue: ""
 				input "password", "password", title: "Your Tado Password", required: true
 			}
+		}
 	}
+
+
 }
 
 def mainPage() {
@@ -99,9 +139,13 @@ def mainPage() {
   		createAccessToken()
   		getToken()
     }
+
+    if (!state.authToken){
+        oauthAccessTokenGrant() }
+
   	getidCommand()
     getTempUnitCommand()
-  	log.debug "Logging debug: ${state.homeId}"
+  	logDebug "Logging debug homeID: ${state.homeId}"
 	   if (state.homeId) {
        return completePage()
        } else {
@@ -111,13 +155,26 @@ def mainPage() {
 
 def completePage(){
 	def description = "Tap 'Next' to proceed"
-			return dynamicPage(name: "completePage", title: "Credentials Accepted!", uninstall:true, install:false,nextPage: listDevices) {
-				section { href url: buildRedirectUrl("receivedHomeId"), style:"embedded", required:false, title:"${getVendorName()} is now connected to Hubitat!", description:description }
+			return dynamicPage(name: "completePage", title: "Credentials appear to be accepted, but you can update details below as required", uninstall:true, install:false,nextPage: listDevices) {
+	    		section {
+                    href url: buildRedirectUrl("receivedHomeId"), style:"embedded", required:false, title:"${getVendorName()} is now connected to Hubitat!", description:description
+                }
+                section("Logging options"){
+	    			input "debugLogging", "bool", title: "Enable debug logging", defaultValue: false
+		    	}
+			    section(hideable: true, hidden: true, "Authentication information, expand to update") {
+				    paragraph "You can get clientID and clientSecret from Tado. These are used for the initial authtoken request."
+    				input "clientId","text", title: "Client ID", required: false
+	    			input "clientSecret", "text", title: "Client secret (save this box before pressing the button below)", required: true, submitOnChange: true
+		    		input "username", "text", title: "Your Tado Username", required: true
+			    	input "password", "password", title: "Your Tado Password", required: true
+			    }
+
 			}
 }
 
 def badAuthPage(){
-	log.debug "In badAuthPage"
+	logDebug "In badAuthPage"
     log.error "login result false"
        		return dynamicPage(name: "badCredentials", title: "Bad Tado Credentials", install:false, uninstall:true, nextPage: Credentials) {
 				section("") {
@@ -127,7 +184,7 @@ def badAuthPage(){
 }
 
 def advancedOptions() {
-	log.debug "In Advanced Options"
+	logDebug "In Advanced Options"
 	def options = getDeviceList()
 	dynamicPage(name: "advancedOptions", title: "Select Advanced Options", install:true) {
     	section("Default temperatures for thermostat actions. Please enter desired temperatures") {
@@ -155,7 +212,7 @@ def advancedOptions() {
 }
 
 def listDevices() {
-	log.debug "In listDevices"
+	logDebug "In listDevices"
 	def options = getDeviceList()
 	dynamicPage(name: "listDevices", title: "Choose devices", install:false, uninstall:true, nextPage: listUsers) {
 		section("Devices") {
@@ -165,7 +222,7 @@ def listDevices() {
 }
 
 def listUsers() {
-	log.debug "In listUsers"
+	logDebug "In listUsers"
 	def options = getUserList()
 	dynamicPage(name: "listUsers", title: "Choose users you wish to create a Virtual Smarthings Presence Sensors for", install:false, uninstall:true, nextPage: advancedOptions) {
 		section("Users") {
@@ -178,16 +235,16 @@ def getToken(){
   if (!state.accessToken) {
 		try {
 			getAccessToken()
-			DEBUG("Creating new Access Token: $state.accessToken")
+			logDebug "Creating new Access Token:" $state.accessToken
 		} catch (ex) {
-			DEBUG("Did you forget to enable OAuth in SmartApp IDE settings")
-            DEBUG(ex)
+			logDebug "Did you forget to enable OAuth in SmartApp IDE settings"
+            logDebug "Exception :" ex
 		}
 	}
 }
 
 def receivedHomeId() {
-	log.debug "In receivedToken"
+	logDebug "In receivedToken"
 
 	def html = """
         <!DOCTYPE html>
@@ -260,118 +317,127 @@ def receivedHomeId() {
 }
 
 def buildRedirectUrl(endPoint) {
-	log.debug "In buildRedirectUrl"
-	log.debug("returning: " + getServerUrl() + "/${hubUID}/apps/${app.id}/${endPoint}?access_token=${state.accessToken}")
+	logDebug "In buildRedirectUrl"
+	logDebug("returning: " + getServerUrl() + "/${hubUID}/apps/${app.id}/${endPoint}?access_token=${state.accessToken}")
 	return getServerUrl() + "/${hubUID}/apps/${app.id}/${endPoint}?access_token=${state.accessToken}"
 }
 
 def getDeviceList() {
   def TadoDevices = getZonesCommand()
+  logDebug "In getDeviceList"
   return TadoDevices.sort()
+
 }
 
 def getUserList() {
   def TadoUsers = getMobileDevicesCommand()
-  return TadoUsers.sort()
+  if (TadoUser != null) {
+	return TadoUsers.sort()
+  }
 }
 
 def installed() {
-	log.debug "Installed with settings: ${settings}"
+	logDebug "Installed with settings: ${settings}"
 	initialize()
 }
 
 def updated() {
-	log.debug "Updated with settings: ${settings}"
+	logDebug "Updated with settings: ${settings}"
   	unsubscribe()
 	unschedule()
 	initialize()
 }
 
 def uninstalled() {
-  log.debug "Uninstalling Tado (Connect)"
+  logDebug "Uninstalling Tado (Connect)"
   revokeAccessToken()
   removeChildDevices(getChildDevices())
-  log.debug "Tado (Connect) Uninstalled"
+  logDebug "Tado (Connect) Uninstalled"
 }
 
 def initialize() {
-	log.debug "Initialized with settings: ${settings}"
+	log.info "Initialized with settings: ${settings}"
 	// Pull the latest device info into state
 	getDeviceList();
     def children = getChildDevices()
     if(settings.devices) {
     	settings.devices.each { device ->
-        log.debug("Devices Inspected ${device.inspect()}")
+        logDebug("Devices Inspected ${device.inspect()}")
 		def item = device.tokenize('|')
         def deviceType = item[0]
         def deviceId = item[1]
         def deviceName = item[2]
         def existingDevices = children.find{ d -> d.deviceNetworkId.contains(deviceId + "|" + deviceType) }
-        log.debug("existingDevices Inspected ${existingDevices.inspect()}")
+        log.info("existingDevices Inspected ${existingDevices.inspect()}")
     	if(!existingDevices) {
-          log.debug("Some Devices were not found....creating Child Device ${deviceName}")
+          logDebug("Some Devices were not found....creating Child Device ${deviceName}")
           try {
             if (deviceType == "HOT_WATER")
             {
-              log.debug("Creating Hot Water Device ${deviceName}")
+              logDebug("Creating Hot Water Device ${deviceName}")
               createChildDevice("Tado Hot Water Control", deviceId + "|" + deviceType + "|" + state.accessToken + "|" + devicename, "${deviceName}", deviceName)
             }
             if (deviceType == "HEATING")
             {
-              log.debug("Creating Heating Device ${deviceName}")
+              logDebug("Creating Heating Device ${deviceName}")
               createChildDevice("Tado Heating Thermostat", deviceId + "|" + deviceType + "|" + state.accessToken + "|" + devicename, "${deviceName}", deviceName)
             }
             if (deviceType == "AIR_CONDITIONING")
             {
-              log.debug("Creating Air Conditioning Device ${deviceName}")
+              logDebug("Creating Air Conditioning Device ${deviceName}")
               createChildDevice("Tado Cooling Thermostat", deviceId + "|" + deviceType + "|" + state.accessToken + "|" + devicename, "${deviceName}", deviceName)
             }
- 			} catch (Exception e) 
+            if (deviceType == "Home")
+            {
+              logDebug("Creating Home Device ${deviceName}")
+              createChildDevice("Tado Home", deviceId + "|" + deviceType + "|" + state.accessToken + "|" + devicename, "${deviceName}", deviceName)
+            }
+ 			} catch (Exception e)
             {
 					log.error "Error creating device: ${e}"
 			}
     		}
 		}
     }
-    
+
     getUserList();
        if(settings.users) {
     	settings.users.each { user ->
-        log.debug("Devices Inspected ${user.inspect()}")
+        logDebug("Devices Inspected ${user.inspect()}")
 		def item = user.tokenize('|')
         def userId = item[0]
         def userName = item[1]
         def existingUsers = children.find{ d -> d.deviceNetworkId.contains(userId + "|" + userName) }
-        log.debug("existingUsers Inspected ${existingUsers.inspect()}")
+        log.info("existingUsers Inspected ${existingUsers.inspect()}")
     	if(!existingUsers) {
-          log.debug("Some Users were not found....creating Child presence Device ${userName}")
-          try 
+          logDebug("Some Users were not found....creating Child presence Device ${userName}")
+          try
           	{
               createChildDevice("Tado User Presence", userId + "|" + userName + "|" + state.accessToken, "${userName}", userName)
- 			} catch (Exception e) 
+ 			} catch (Exception e)
             {
 					log.error "Error creating device: ${e}"
 			}
     		}
 		}
     }
-    
-    
+
+
 	// Do the initial poll
     getInititialDeviceInfo()
-	
+
 	// Schedule it to run every 5 minutes
 	runEvery5Minutes("poll")
     runEvery5Minutes("userPoll")
 }
 
 def getInititialDeviceInfo(){
-	log.debug "getInititialDeviceInfo"
+	logDebug "getInititialDeviceInfo"
 	getDeviceList();
 	def children = getChildDevices()
 	if(settings.devices) {
     settings.devices.each { device ->
-      log.debug("Devices Inspected ${device.inspect()}")
+      logDebug("Devices Inspected ${device.inspect()}")
       def item = device.tokenize('|')
       def deviceType = item[0]
       def deviceId = item[1]
@@ -389,28 +455,30 @@ def getHubID(){
     if (myHub){
         hubID = myHub.id
     } else {
-        log.debug("hub type is ${location.hubs[0].type}")
-        def hubs = location.hubs.findAll{ it.type == "PHYSICAL" } 
+        logDebug("hub type is ${location.hubs[0].type}")
+        def hubs = location.hubs.findAll{ it.type == "PHYSICAL" }
         if (hubs.size() == 1){
             hubID = hubs[0].id
         }
     }
-    log.debug("Returning Hub ID: ${hubID}")
+    logDebug("Returning Hub ID: ${hubID}")
     return hubID
 }
 
 def poll() {
-	log.debug "In Poll"
+	logDebug "In Poll"
 	getDeviceList();
+    logDebug "returned device list"
   def children = getChildDevices()
+    logDebug("Children Inspected ${children}")
   if(settings.devices) {
     settings.devices.each { device ->
-      log.debug("Devices Inspected ${device.inspect()}")
+      log.info("Devices Inspected ${device.inspect()}")
       def item = device.tokenize('|')
       def deviceType = item[0]
       def deviceId = item[1]
       def deviceName = item[2]
-      def existingDevices = children.find{ d -> d.deviceNetworkId.contains(deviceId + "|" + deviceType) }
+      def existingDevices = children.find{ d -> d.deviceNetworkId.startsWith(deviceId + "|" + deviceType) }
       if(existingDevices) {
         existingDevices.poll()
       }
@@ -419,25 +487,32 @@ def poll() {
 }
 
 def userPoll() {
-	log.debug "In UserPoll"
+	logDebug "In UserPoll"
     def children = getChildDevices();
     if(settings.users) {
     	settings.users.each { user ->
-    		log.debug("Devices Inspected ${user.inspect()}")
+    		log.info("Devices Inspected ${user.inspect()}")
 			def item = user.tokenize('|')
         	def userId = item[0]
         	def userName = item[1]
         	def existingUsers = children.find{ d -> d.deviceNetworkId.contains(userId + "|" + userName) }
-        	log.debug("existingUsers Inspected ${existingUsers.inspect()}")
+        	logDebug("existingUsers Inspected ${existingUsers.inspect()}")
     		if(existingUsers) {
           		existingUsers.poll()
         	}
      	}
    }
 }
-        
+
+def homePoll() {
+	logDebug "In HomePoll"
+    def children = getChildDevices();
+    if(settings.home) {
+   }
+}
+
 def createChildDevice(deviceFile, dni, name, label) {
-	log.debug "In createChildDevice"
+	logDebug "In createChildDevice"
     try{
 		def childDevice = addChildDevice("fuzzysb", deviceFile, dni, getHubID(), [name: name, label: label, completedSetup: true])
 	} catch (e) {
@@ -446,74 +521,81 @@ def createChildDevice(deviceFile, dni, name, label) {
 }
 
 private sendCommand(method,childDevice,args = []) {
-    def methods = [
-		'getid': [
+    logDebug "current timestamp: " + now() + ", token expiry: " + state.authTokenExpires
+    if(now() >= state.authTokenExpires) {
+		logDebug "Auth token expired"
+        refreshToken();
+	}
+      logDebug "auth token: " + state.authToken
+
+  def methods = [
+	'getid': [
         			uri: apiUrl(),
                     path: "/api/v2/me",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
     'gettempunit': [
         			uri: apiUrl(),
                     path: "/api/v2/homes/${state.homeId}",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
     'getzones': [
              uri: apiUrl(),
                     path: "/api/v2/homes/" + state.homeId + "/zones",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
 	'getMobileDevices': [
              uri: apiUrl(),
                     path: "/api/v2/homes/" + state.homeId + "/mobileDevices",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
     'getcapabilities': [
         			uri: apiUrl(),
                     path: "/api/v2/homes/" + state.homeId + "/zones/" + args[0] + "/capabilities",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
     'status': [
         			uri: apiUrl(),
                     path: "/api/v2/homes/" + state.homeId + "/zones/" + args[0] + "/state",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
 	'userStatus': [
              		uri: apiUrl(),
                     path: "/api/v2/homes/" + state.homeId + "/mobileDevices",
                     requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                     ],
 	'temperature': [
         			uri: apiUrl(),
         			path: "/api/v2/homes/" + state.homeId + "/zones/" + args[0] + "/overlay",
         			requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password],
+                    headers: ["Authorization": "Bearer " + state.authToken ],
                   	body: args[1]
                    	],
 	'weatherStatus': [
         			uri: apiUrl(),
         			path: "/api/v2/homes/" + state.homeId + "/weather",
         			requestContentType: "application/json",
-    				query: [username:settings.username, password:settings.password]
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                    	],
     'deleteEntry': [
         			uri: apiUrl(),
         			path: "/api/v2/homes/" + state.homeId + "/zones/" + args[0] + "/overlay",
         			requestContentType: "application/json",
-                    query: [username:settings.username, password:settings.password],
+                    headers: ["Authorization": "Bearer " + state.authToken ]
                    	]
 	]
 
 	def request = methods.getAt(method)
-      log.debug "Http Params ("+request+")"
+          logDebug "Http Params ("+request+")"
       try{
-        log.debug "Executing 'sendCommand'"
+        logDebug "Executing 'sendCommand' for method" + " " + method
           if (method == "getid"){
             httpGet(request) { resp ->
                 parseMeResponse(resp)
@@ -547,8 +629,8 @@ private sendCommand(method,childDevice,args = []) {
                 parseputResponse(resp,childDevice)
             }
           }else if (method == "weatherStatus"){
-            log.debug "calling weatherStatus Method"
-            httpGet(request) { resp ->
+            logDebug "calling weatherStatus Method"
+                httpGet(request) { resp ->
                 parseweatherResponse(resp,childDevice)
             }
           }else if (method == "deleteEntry"){
@@ -559,67 +641,67 @@ private sendCommand(method,childDevice,args = []) {
             httpGet(request)
         }
     } catch(Exception e){
-        log.debug("___exception: " + e)
+        logDebug("___exception sendcommand: " + e)
     }
 }
 
 // Parse incoming device messages to generate events
 private parseMeResponse(resp) {
-    log.debug("Executing parseMeResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseMeResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     if(resp.status == 200) {
-    	log.debug("Executing parseMeResponse.successTrue")
+    	logDebug("Executing parseMeResponse.successTrue")
         state.homeId = resp.data.homes[0].id
-        log.debug("Got HomeID Value: " + state.homeId)
+        logDebug("Got HomeID Value: " + state.homeId)
 
     }else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
 private parseputResponse(resp,childDevice) {
-	log.debug("Executing parseputResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+	logDebug("Executing parseputResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
 }
 
 private parsedeleteResponse(resp,childDevice) {
-	log.debug("Executing parsedeleteResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+	logDebug("Executing parsedeleteResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
 }
 
 private parseUserResponse(resp,childDevice) {
   	def item = (childDevice.device.deviceNetworkId).tokenize('|')
   	def userId = item[0]
   	def userName = item[1]
-    log.debug("Executing parseUserResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseUserResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     if(resp.status == 200) {
       def restUsers = resp.data
-      log.debug("Executing parseUserResponse.successTrue")
-      log.debug("UserId is ${userId} and userName is ${userName}")
+      logDebug("Executing parseUserResponse.successTrue")
+      logDebug("UserId is ${userId} and userName is ${userName}")
       for (TadoUser in restUsers) {
-      	log.debug("TadoUserId is ${TadoUser.id}")
+      	logDebug("TadoUserId is ${TadoUser.id}")
       	if ((TadoUser.id).toString() == (userId).toString())
         {
-         log.debug("Entering presence Assesment for User Id: ${userId}")
+         logDebug("Entering presence Assesment for User Id: ${userId}")
          if (TadoUser.settings.geoTrackingEnabled == true)
          {
-         	log.debug("GeoTracking is Enabled for User Id: ${userId}")
+         	logDebug("GeoTracking is Enabled for User Id: ${userId}")
         	if (TadoUser.location.atHome == true)
-            {	
-            	log.debug("Send presence Home Event Fired")
+            {
+            	logDebug("Send presence Home Event Fired")
                	childDevice?.sendEvent(name:"presence",value: "present")
             } else if (TadoUser.location.atHome == false)
             {
-            	log.debug("Send presence Away Event Fired")
+            	logDebug("Send presence Away Event Fired")
             	childDevice?.sendEvent(name:"presence",value: "not present")
             }
         }
-            
+
         }
       }
     } else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
@@ -630,10 +712,10 @@ private parseResponse(resp,childDevice) {
   def deviceToken = item[2]
   if (deviceType == "AIR_CONDITIONING")
   {
-    log.debug("Executing parseResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     def temperatureUnit = state.tempunit
-    log.debug("Temperature Unit is ${temperatureUnit}")
+    logDebug("Temperature Unit is ${temperatureUnit}")
     def humidityUnit = "%"
     def ACMode
     def ACFanSpeed
@@ -641,7 +723,7 @@ private parseResponse(resp,childDevice) {
     def thermostatSetpoint
     def tOperatingState
     if(resp.status == 200) {
-        log.debug("Executing parseResponse.successTrue")
+        logDebug("Executing parseResponse.successTrue")
         def temperature
         if (temperatureUnit == "C") {
         	temperature = (Math.round(resp.data.sensorDataPoints.insideTemperature.celsius *10 ) / 10)
@@ -649,9 +731,9 @@ private parseResponse(resp,childDevice) {
         else if(temperatureUnit == "F"){
         	temperature = (Math.round(resp.data.sensorDataPoints.insideTemperature.fahrenheit * 10) / 10)
         }
-        log.debug("Read temperature: " + temperature)
+        logDebug("Read temperature: " + temperature)
         childDevice?.sendEvent(name:"temperature",value:temperature,unit:temperatureUnit)
-        log.debug("Send Temperature Event Fired")
+        logDebug("Send Temperature Event Fired")
         def autoOperation = "OFF"
         if(resp.data.overlayType == null){
         	autoOperation = resp.data.tadoMode
@@ -661,9 +743,9 @@ private parseResponse(resp,childDevice) {
         }else if(resp.data.overlayType == "MANUAL"){
         	autoOperation = "MANUAL"
         }
-        log.debug("Read tadoMode: " + autoOperation)
+        logDebug("Read tadoMode: " + autoOperation)
         childDevice?.sendEvent(name:"tadoMode",value:autoOperation)
-        log.debug("Send thermostatMode Event Fired")
+        logDebug("Send thermostatMode Event Fired")
 
         def humidity
         if (resp.data.sensorDataPoints.humidity.percentage != null){
@@ -671,22 +753,22 @@ private parseResponse(resp,childDevice) {
         }else{
         	humidity = "--"
         }
-        log.debug("Read humidity: " + humidity)
+        logDebug("Read humidity: " + humidity)
         childDevice?.sendEvent(name:"humidity",value:humidity,unit:humidityUnit)
 
     	if (resp.data.setting.power == "OFF"){
             tOperatingState = "idle"
             ACMode = "off"
             ACFanMode = "off"
-            log.debug("Read thermostatMode: " + ACMode)
+            logDebug("Read thermostatMode: " + ACMode)
             ACFanSpeed = "OFF"
-            log.debug("Read tadoFanSpeed: " + ACFanSpeed)
+            logDebug("Read tadoFanSpeed: " + ACFanSpeed)
             thermostatSetpoint = "--"
-            log.debug("Read thermostatSetpoint: " + thermostatSetpoint)
+            logDebug("Read thermostatSetpoint: " + thermostatSetpoint)
       }
       else if (resp.data.setting.power == "ON"){
         ACMode = (resp.data.setting.mode).toLowerCase()
-        log.debug("thermostatMode: " + ACMode)
+        logDebug("thermostatMode: " + ACMode)
         ACFanSpeed = resp.data.setting.fanSpeed
         if (ACFanSpeed == null) {
           ACFanSpeed = "--"
@@ -695,7 +777,7 @@ private parseResponse(resp,childDevice) {
           if (resp.data.overlay.termination.type == "TIMER"){
             if (resp.data.overlay.termination.durationInSeconds == "3600"){
               ACMode = "emergency heat"
-              log.debug("thermostatMode is heat, however duration shows the state is: " + ACMode)
+              logDebug("thermostatMode is heat, however duration shows the state is: " + ACMode)
             }
           }
         }
@@ -722,8 +804,8 @@ private parseResponse(resp,childDevice) {
         			tOperatingState = "heating|cooling"
         		break
 			}
-            log.debug("Read thermostatOperatingState: " + tOperatingState)
-        	log.debug("Read tadoFanSpeed: " + ACFanSpeed)
+            logDebug("Read thermostatOperatingState: " + tOperatingState)
+        	logDebug("Read tadoFanSpeed: " + ACFanSpeed)
 
         if (ACMode == "dry" || ACMode == "auto" || ACMode == "fan"){
         	thermostatSetpoint = "--"
@@ -737,39 +819,39 @@ private parseResponse(resp,childDevice) {
         		thermostatSetpoint = Math.round(resp.data.setting.temperature.fahrenheit)
         	}
         }
-        log.debug("Read thermostatSetpoint: " + thermostatSetpoint)
+        logDebug("Read thermostatSetpoint: " + thermostatSetpoint)
       }
     }else{
-        log.debug("Executing parseResponse.successFalse")
+        logDebug("Executing parseResponse.successFalse")
     }
     childDevice?.sendEvent(name:"thermostatOperatingState",value:tOperatingState)
-    log.debug("Send thermostatOperatingState Event Fired")
+    logDebug("Send thermostatOperatingState Event Fired")
     childDevice?.sendEvent(name:"tadoFanSpeed",value:ACFanSpeed)
-    log.debug("Send tadoFanSpeed Event Fired")
+    logDebug("Send tadoFanSpeed Event Fired")
     childDevice?.sendEvent(name:"thermostatFanMode",value:ACFanMode)
-    log.debug("Send thermostatFanMode Event Fired")
+    logDebug("Send thermostatFanMode Event Fired")
     childDevice?.sendEvent(name:"thermostatMode",value:ACMode)
-    log.debug("Send thermostatMode Event Fired")
+    logDebug("Send thermostatMode Event Fired")
     childDevice?.sendEvent(name:"thermostatSetpoint",value:thermostatSetpoint,unit:temperatureUnit)
-    log.debug("Send thermostatSetpoint Event Fired")
+    logDebug("Send thermostatSetpoint Event Fired")
     childDevice?.sendEvent(name:"heatingSetpoint",value:thermostatSetpoint,unit:temperatureUnit)
-    log.debug("Send heatingSetpoint Event Fired")
+    logDebug("Send heatingSetpoint Event Fired")
     childDevice?.sendEvent(name:"coolingSetpoint",value:thermostatSetpoint,unit:temperatureUnit)
-    log.debug("Send coolingSetpoint Event Fired")
+    logDebug("Send coolingSetpoint Event Fired")
   }
   if (deviceType == "HEATING")
   {
-    log.debug("Executing parseResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     def temperatureUnit = state.tempunit
-    log.debug("Temperature Unit is ${temperatureUnit}")
+    logDebug("Temperature Unit is ${temperatureUnit}")
     def humidityUnit = "%"
-    def ACMode
-    def ACFanSpeed
+    //def ACMode
+    //def ACFanSpeed
     def thermostatSetpoint
     def tOperatingState
     if(resp.status == 200) {
-        log.debug("Executing parseResponse.successTrue")
+        logDebug("Executing parseResponse.successTrue")
         def temperature
         if (temperatureUnit == "C") {
         	temperature = (Math.round(resp.data.sensorDataPoints.insideTemperature.celsius * 10 ) / 10)
@@ -777,9 +859,9 @@ private parseResponse(resp,childDevice) {
         else if(temperatureUnit == "F"){
         	temperature = (Math.round(resp.data.sensorDataPoints.insideTemperature.fahrenheit * 10) / 10)
         }
-        log.debug("Read temperature: " + temperature)
+        logDebug("Read temperature: " + temperature)
         childDevice?.sendEvent(name: 'temperature', value: temperature, unit: temperatureUnit)
-        log.debug("Send Temperature Event Fired")
+        logDebug("Send Temperature Event Fired")
         def autoOperation = "OFF"
         if(resp.data.overlayType == null){
         	autoOperation = resp.data.tadoMode
@@ -789,25 +871,37 @@ private parseResponse(resp,childDevice) {
         }else if(resp.data.overlayType == "MANUAL"){
         	autoOperation = "MANUAL"
         }
-        log.debug("Read tadoMode: " + autoOperation)
+        logDebug("Read tadoMode: " + autoOperation)
         childDevice?.sendEvent(name: 'tadoMode', value: autoOperation)
 
 		if (resp.data.setting.power == "ON"){
-			childDevice?.sendEvent(name: 'thermostatMode', value: "heat")
-			childDevice?.sendEvent(name: 'thermostatOperatingState', value: "heating")
-			log.debug("Send thermostatMode Event Fired")
+
+
+
 			if (temperatureUnit == "C") {
 				thermostatSetpoint = resp.data.setting.temperature.celsius
 			}
 			else if(temperatureUnit == "F"){
 				thermostatSetpoint = resp.data.setting.temperature.fahrenheit
 			}
-			log.debug("Read thermostatSetpoint: " + thermostatSetpoint)
+			logDebug("Read thermostatSetpoint: " + thermostatSetpoint)
+
+			childDevice?.sendEvent(name: 'thermostatMode', value: "heat")
+
+			if (temperature < thermostatSetpoint) {
+				logDebug("Heat mode; setpoint not reached")
+				childDevice?.sendEvent(name: 'thermostatOperatingState', value: "heating")
+			} else {
+				logDebug("Heat mode; setpoint reached")
+				childDevice?.sendEvent(name: 'thermostatOperatingState', value: "idle")
+			}
+			logDebug("Send thermostatMode Event Fired")
+
 		} else if(resp.data.setting.power == "OFF"){
 			thermostatSetpoint = "--"
 			childDevice?.sendEvent(name: 'thermostatMode', value: "off")
 			childDevice?.sendEvent(name: 'thermostatOperatingState', value: "idle")
-			log.debug("Send thermostatMode Event Fired")
+			logDebug("Send thermostatMode Event Fired")
 		}
 
         def humidity
@@ -816,34 +910,47 @@ private parseResponse(resp,childDevice) {
         }else{
         	humidity = "--"
         }
-        log.debug("Read humidity: " + humidity)
+        logDebug("Read humidity: " + humidity)
 
         childDevice?.sendEvent(name: 'humidity', value: humidity,unit: humidityUnit)
 
+
+        def heatingPower
+        heatingPower = resp.data.activityDataPoints.heatingPower.percentage
+        childDevice?.sendEvent(name: 'heatingPower', value: heatingPower)
+
+
+        def openWindow
+        if (resp.data.openwindow != null){
+            openWindow = true
+        } else {
+            openWindow = false
+        }
+        childDevice?.sendEvent(name: 'openWindow', value: openWindow)
 	}
 
 	else{
-        log.debug("Executing parseResponse.successFalse")
+        logDebug("Executing parseResponse.successFalse")
     }
 
     childDevice?.sendEvent(name: 'thermostatSetpoint', value: thermostatSetpoint, unit: temperatureUnit)
-    log.debug("Send thermostatSetpoint Event Fired")
+    logDebug("Send thermostatSetpoint Event Fired")
     childDevice?.sendEvent(name: 'heatingSetpoint', value: thermostatSetpoint, unit: temperatureUnit)
-    log.debug("Send heatingSetpoint Event Fired")
+    logDebug("Send heatingSetpoint Event Fired")
   }
   if (deviceType == "HOT_WATER")
   {
-    log.debug("Executing parseResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     def temperatureUnit = state.tempunit
-    log.debug("Temperature Unit is ${temperatureUnit}")
+    logDebug("Temperature Unit is ${temperatureUnit}")
     def humidityUnit = "%"
     def ACMode
     def ACFanSpeed
     def thermostatSetpoint
     def tOperatingState
     if(resp.status == 200) {
-    log.debug("Executing parseResponse.successTrue")
+    logDebug("Executing parseResponse.successTrue")
     def temperature
     if (state.supportsWaterTempControl == "true" && resp.data.tadoMode != null && resp.data.setting.power != "OFF"){
     if (temperatureUnit == "C") {
@@ -852,12 +959,12 @@ private parseResponse(resp,childDevice) {
     else if(temperatureUnit == "F"){
       temperature = (Math.round(resp.data.setting.temperature.fahrenheit * 10) / 10)
     }
-    log.debug("Read temperature: " + temperature)
+    logDebug("Read temperature: " + temperature)
     childDevice?.sendEvent(name: 'temperature', value: temperature, unit: temperatureUnit)
-    log.debug("Send Temperature Event Fired")
+    logDebug("Send Temperature Event Fired")
     } else {
       childDevice?.sendEvent(name: 'temperature', value: "--", unit: temperatureUnit)
-      log.debug("Send Temperature Event Fired")
+      logDebug("Send Temperature Event Fired")
     }
     def autoOperation = "OFF"
     if(resp.data.overlayType == null){
@@ -868,19 +975,19 @@ private parseResponse(resp,childDevice) {
     }else if(resp.data.overlayType == "MANUAL"){
       autoOperation = "MANUAL"
     }
-    log.debug("Read tadoMode: " + autoOperation)
+    logDebug("Read tadoMode: " + autoOperation)
     childDevice?.sendEvent(name: 'tadoMode', value: autoOperation)
 
     if (resp.data.setting.power == "ON"){
       childDevice?.sendEvent(name: 'thermostatMode', value: "heat")
       childDevice?.sendEvent(name: 'thermostatOperatingState', value: "heating")
-      log.debug("Send thermostatMode Event Fired")
+      logDebug("Send thermostatMode Event Fired")
       } else if(resp.data.setting.power == "OFF"){
         childDevice?.sendEvent(name: 'thermostatMode', value: "off")
         childDevice?.sendEvent(name: 'thermostatOperatingState', value: "idle")
-        log.debug("Send thermostatMode Event Fired")
+        logDebug("Send thermostatMode Event Fired")
       }
-      log.debug("Send thermostatMode Event Fired")
+      logDebug("Send thermostatMode Event Fired")
       if (state.supportsWaterTempControl == "true" && resp.data.tadoMode != null && resp.data.setting.power != "OFF"){
         if (temperatureUnit == "C") {
           thermostatSetpoint = resp.data.setting.temperature.celsius
@@ -888,126 +995,126 @@ private parseResponse(resp,childDevice) {
         else if(temperatureUnit == "F"){
           thermostatSetpoint = resp.data.setting.temperature.fahrenheit
         }
-        log.debug("Read thermostatSetpoint: " + thermostatSetpoint)
+        logDebug("Read thermostatSetpoint: " + thermostatSetpoint)
         } else {
           thermostatSetpoint = "--"
         }
       }
 
       else{
-        log.debug("Executing parseResponse.successFalse")
+        logDebug("Executing parseResponse.successFalse")
       }
 
       childDevice?.sendEvent(name: 'thermostatSetpoint', value: thermostatSetpoint, unit: temperatureUnit)
-      log.debug("Send thermostatSetpoint Event Fired")
+      logDebug("Send thermostatSetpoint Event Fired")
       childDevice?.sendEvent(name: 'heatingSetpoint', value: thermostatSetpoint, unit: temperatureUnit)
-      log.debug("Send heatingSetpoint Event Fired")
+      logDebug("Send heatingSetpoint Event Fired")
   }
 }
 
 private parseTempResponse(resp) {
-    log.debug("Executing parseTempResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseTempResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     if(resp.status == 200) {
-    	log.debug("Executing parseTempResponse.successTrue")
+    	logDebug("Executing parseTempResponse.successTrue")
         def tempunitname = resp.data.temperatureUnit
         if (tempunitname == "CELSIUS") {
-        	log.debug("Setting Temp Unit to C")
+        	logDebug("Setting Temp Unit to C")
         	state.tempunit = "C"
         }
         else if(tempunitname == "FAHRENHEIT"){
-        	log.debug("Setting Temp Unit to F")
+        	logDebug("Setting Temp Unit to F")
         	state.tempunit = "F"
         }
     }else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
 private parseZonesResponse(resp) {
-    log.debug("Executing parseZonesResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseZonesResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     if(resp.status == 200) {
       def restDevices = resp.data
       def TadoDevices = []
-      log.debug("Executing parseZoneResponse.successTrue")
+      logDebug("Executing parseZoneResponse.successTrue")
       restDevices.each { Tado -> TadoDevices << ["${Tado.type}|${Tado.id}|${Tado.name}":"${Tado.name}"] }
-      log.debug(TadoDevices)
+      logDebug(TadoDevices)
       return TadoDevices
     }else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
 private parseMobileDevicesResponse(resp) {
-    log.debug("Executing parseMobileDevicesResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseMobileDevicesResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
     if(resp.status == 200) {
       def restUsers = resp.data
       def TadoUsers = []
-      log.debug("Executing parseMobileDevicesResponse.successTrue")
-      restUsers.each { TadoUser -> 
+      logDebug("Executing parseMobileDevicesResponse.successTrue")
+      restUsers.each { TadoUser ->
       	if (TadoUser.settings.geoTrackingEnabled == true)
         {
         	TadoUsers << ["${TadoUser.id}|${TadoUser.name}":"${TadoUser.name}"]
         }
       }
-      log.debug(TadoUsers)
+      logDebug(TadoUsers)
       return TadoUsers
     }else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
 private parseCapabilitiesResponse(resp,childDevice) {
-    log.debug("Executing parseCapabilitiesResponse: "+resp.data)
-    log.debug("Output status: " + resp.status)
+    logDebug("Executing parseCapabilitiesResponse: "+resp.data)
+    logDebug("Output status: " + resp.status)
     if(resp.status == 200) {
     	try
       {
-    	log.debug("Executing parseResponse.successTrue")
+    	logDebug("Executing parseResponse.successTrue")
        	childDevice?.setCapabilitytadoType(resp.data.type)
-        log.debug("Tado Type is ${resp.data.type}")
+        logDebug("Tado Type is ${resp.data.type}")
         if(resp.data.type == "AIR_CONDITIONING")
         {
           try
           {
             if(resp.data.AUTO || (resp.data.AUTO).toString() == "[:]"){
-              log.debug("settingautocapability state true")
+              logDebug("settingautocapability state true")
               childDevice?.setCapabilitySupportsAuto("true")
             } else {
-              log.debug("settingautocapability state false")
+              logDebug("settingautocapability state false")
               childDevice?.setCapabilitySupportsAuto("false")
             }
             if(resp.data.AUTO.swings || (resp.data.AUTO.swings).toString() == "[:]")
             {
-              log.debug("settingautoswingcapability state true")
+              logDebug("settingautoswingcapability state true")
             childDevice?.setCapabilitySupportsAutoSwing("true")
             }
             else
             {
-              log.debug("settingautoswingcapability state false")
+              logDebug("settingautoswingcapability state false")
               childDevice?.setCapabilitySupportsAutoSwing("false")
             }
           }
           catch(Exception e)
           {
-            log.debug("___exception parsing Auto Capabiity: " + e)
+            logDebug("___exception parsing Auto Capabiity: " + e)
           }
           try
           {
               if(resp.data.COOL || (resp.data.COOL).toString() == "[:]"){
-              log.debug("setting COOL capability state true")
+              logDebug("setting COOL capability state true")
               childDevice?.setCapabilitySupportsCool("true")
                 def coolfanmodelist = resp.data.COOL.fanSpeeds
                 if(resp.data.COOL.swings || (resp.data.COOL.swings).toString() == "[:]")
                 {
-                  log.debug("settingcoolswingcapability state true")
+                  logDebug("settingcoolswingcapability state true")
                   childDevice?.setCapabilitySupportsCoolSwing("true")
                 }
                 else
                 {
-                  log.debug("settingcoolswingcapability state false")
+                  logDebug("settingcoolswingcapability state false")
                   childDevice?.setCapabilitySupportsCoolSwing("false")
                 }
                 if(resp.data.COOL.fanSpeeds || (resp.data.COOL.fanSpeeds).toString() == "[:]")
@@ -1019,10 +1126,10 @@ private parseCapabilitiesResponse(resp,childDevice) {
                   childDevice?.setCapabilitySupportsCoolFanSpeed("false")
                 }
                 if(coolfanmodelist.find { it == 'AUTO' }){
-                  log.debug("setting COOL Auto Fan Speed capability state true")
+                  logDebug("setting COOL Auto Fan Speed capability state true")
                   childDevice?.setCapabilitySupportsCoolAutoFanSpeed("true")
                 } else {
-                  log.debug("setting COOL Auto Fan Speed capability state false")
+                  logDebug("setting COOL Auto Fan Speed capability state false")
                   childDevice?.setCapabilitySupportsCoolAutoFanSpeed("false")
                 }
                 if (state.tempunit == "C"){
@@ -1033,76 +1140,76 @@ private parseCapabilitiesResponse(resp,childDevice) {
                   childDevice?.setCapabilityMinCoolTemp(resp.data.COOL.temperatures.fahrenheit.min)
                 }
             } else {
-              log.debug("setting COOL capability state false")
+              logDebug("setting COOL capability state false")
               childDevice?.setCapabilitySupportsCool("false")
             }
           }
           catch(Exception e)
           {
-            log.debug("___exception parsing Cool Capabiity: " + e)
+            logDebug("___exception parsing Cool Capabiity: " + e)
           }
           try
           {
             if(resp.data.DRY || (resp.data.DRY).toString() == "[:]"){
-              log.debug("setting DRY capability state true")
+              logDebug("setting DRY capability state true")
               childDevice?.setCapabilitySupportsDry("true")
             } else {
-              log.debug("setting DRY capability state false")
+              logDebug("setting DRY capability state false")
               childDevice?.setCapabilitySupportsDry("false")
             }
             if(resp.data.DRY.swings || (resp.data.DRY.swings).toString() == "[:]")
             {
-              log.debug("settingdryswingcapability state true")
+              logDebug("settingdryswingcapability state true")
             childDevice?.setCapabilitySupportsDrySwing("true")
             }
             else
             {
-              log.debug("settingdryswingcapability state false")
+              logDebug("settingdryswingcapability state false")
               childDevice?.setCapabilitySupportsDrySwing("false")
             }
           }
           catch(Exception e)
           {
-            log.debug("___exception parsing Dry Capabiity: " + e)
+            logDebug("___exception parsing Dry Capabiity: " + e)
           }
           try
           {
             if(resp.data.FAN || (resp.data.FAN).toString() == "[:]"){
-              log.debug("setting FAN capability state true")
+              logDebug("setting FAN capability state true")
               childDevice?.setCapabilitySupportsFan("true")
             } else {
-              log.debug("setting FAN capability state false")
+              logDebug("setting FAN capability state false")
               childDevice?.setCapabilitySupportsFan("false")
             }
             if(resp.data.FAN.swings || (resp.data.FAN.swings).toString() == "[:]")
             {
-              log.debug("settingfanswingcapability state true")
+              logDebug("settingfanswingcapability state true")
             childDevice?.setCapabilitySupportsFanSwing("true")
             }
             else
             {
-              log.debug("settingfanswingcapability state false")
+              logDebug("settingfanswingcapability state false")
               childDevice?.setCapabilitySupportsFanSwing("false")
             }
           }
           catch(Exception e)
           {
-            log.debug("___exception parsing Fan Capabiity: " + e)
+            logDebug("___exception parsing Fan Capabiity: " + e)
           }
           try
           {
             if(resp.data.HEAT || (resp.data.HEAT).toString() == "[:]"){
-              log.debug("setting HEAT capability state true")
+              logDebug("setting HEAT capability state true")
               childDevice?.setCapabilitySupportsHeat("true")
                 def heatfanmodelist = resp.data.HEAT.fanSpeeds
                 if(resp.data.HEAT.swings || (resp.data.HEAT.swings).toString() == "[:]")
                 {
-                  log.debug("settingheatswingcapability state true")
+                  logDebug("settingheatswingcapability state true")
                   childDevice?.setCapabilitySupportsHeatSwing("true")
                 }
                 else
                 {
-                  log.debug("settingheatswingcapability state false")
+                  logDebug("settingheatswingcapability state false")
                   childDevice?.setCapabilitySupportsHeatSwing("false")
                 }
                 if(resp.data.HEAT.fanSpeeds || (resp.data.HEAT.fanSpeeds).toString() == "[:]")
@@ -1114,10 +1221,10 @@ private parseCapabilitiesResponse(resp,childDevice) {
                   childDevice?.setCapabilitySupportsHeatFanSpeed("false")
                 }
                 if(heatfanmodelist.find { it == 'AUTO' }){
-                  log.debug("setting HEAT Auto Fan Speed capability state true")
+                  logDebug("setting HEAT Auto Fan Speed capability state true")
                   childDevice?.setCapabilitySupportsHeatAutoFanSpeed("true")
                 } else {
-                  log.debug("setting HEAT Auto Fan Speed capability state false")
+                  logDebug("setting HEAT Auto Fan Speed capability state false")
                   childDevice?.setCapabilitySupportsHeatAutoFanSpeed("false")
                 }
                 if (state.tempunit == "C"){
@@ -1128,19 +1235,19 @@ private parseCapabilitiesResponse(resp,childDevice) {
                   childDevice?.setCapabilityMinHeatTemp(resp.data.HEAT.temperatures.fahrenheit.min)
                 }
             } else {
-              log.debug("setting HEAT capability state false")
+              logDebug("setting HEAT capability state false")
               childDevice?.setCapabilitySupportsHeat("false")
             }
           }catch(Exception e)
           {
-            log.debug("___exception parsing Heat Capabiity: " + e)
+            logDebug("___exception parsing Heat Capabiity: " + e)
           }
         }
         if(resp.data.type == "HEATING")
         {
           if(resp.data.type == "HEATING")
           {
-          	log.debug("setting HEAT capability state true")
+          	logDebug("setting HEAT capability state true")
           	childDevice?.setCapabilitySupportsHeat("true")
             if (state.tempunit == "C")
             {
@@ -1155,14 +1262,14 @@ private parseCapabilitiesResponse(resp,childDevice) {
           }
           else
           {
-          	log.debug("setting HEAT capability state false")
+          	logDebug("setting HEAT capability state false")
           	childDevice?.setCapabilitySupportsHeat("false")
           }
         }
         if(resp.data.type == "HOT_WATER")
         {
             if(resp.data.type == "HOT_WATER"){
-              log.debug("setting WATER capability state true")
+              logDebug("setting WATER capability state true")
               dchildDevice?.setCapabilitySupportsWater("true")
               if (resp.data.canSetTemperature == true){
                 childDevice?.setCapabilitySupportsWaterTempControl("true")
@@ -1184,29 +1291,29 @@ private parseCapabilitiesResponse(resp,childDevice) {
             }
             else
             {
-            log.debug("setting Water capability state false")
+            logDebug("setting Water capability state false")
             childDevice?.setCapabilitySupportsWater("false")
             }
         }
       }
       catch(Exception e)
       {
-        log.debug("___exception: " + e)
+        logDebug("___exception: " + e)
       }
     }
     else if(resp.status == 201)
     {
-      log.debug("Something was created/updated")
+      logDebug("Something was created/updated")
     }
 }
 
 private parseweatherResponse(resp,childDevice) {
-    log.debug("Executing parseweatherResponse: "+resp.data)
-    log.debug("Output status: "+resp.status)
+    logDebug("Executing parseweatherResponse: "+resp.data)
+    logDebug("Output status: "+resp.status)
 	def temperatureUnit = state.tempunit
-    log.debug("Temperature Unit is ${temperatureUnit}")
+    logDebug("Temperature Unit is ${temperatureUnit}")
     if(resp.status == 200) {
-    	log.debug("Executing parseResponse.successTrue")
+    	logDebug("Executing parseResponse.successTrue")
         def outsidetemperature
         if (temperatureUnit == "C") {
         	outsidetemperature = resp.data.outsideTemperature.celsius
@@ -1214,33 +1321,33 @@ private parseweatherResponse(resp,childDevice) {
         else if(temperatureUnit == "F"){
         	outsidetemperature = resp.data.outsideTemperature.fahrenheit
         }
-        log.debug("Read outside temperature: " + outsidetemperature)
+        logDebug("Read outside temperature: " + outsidetemperature)
         childDevice?.sendEvent(name: 'outsidetemperature', value: outsidetemperature, unit: temperatureUnit)
-        log.debug("Send Outside Temperature Event Fired")
+        logDebug("Send Outside Temperature Event Fired")
         return result
 
     }else if(resp.status == 201){
-        log.debug("Something was created/updated")
+        logDebug("Something was created/updated")
     }
 }
 
 def getidCommand(){
-	log.debug "Executing 'sendCommand.getidCommand'"
+	logDebug "Executing 'sendCommand.getidCommand'"
 	sendCommand("getid",null,[])
 }
 
 def getTempUnitCommand(){
-	log.debug "Executing 'sendCommand.getidCommand'"
+	logDebug "Executing 'sendCommand.getidCommand'"
 	sendCommand("gettempunit",null,[])
 }
 
 def getZonesCommand(){
-	log.debug "Executing 'sendCommand.getzones'"
+	logDebug "Executing 'sendCommand.getzones'"
 	sendCommand("getzones",null,[])
 }
 
 def getMobileDevicesCommand(){
-	log.debug "Executing 'sendCommand.getMobileDevices'"
+	logDebug "Executing 'sendCommand.getMobileDevices'"
 	sendCommand("getMobileDevices",null,[])
 }
 
@@ -1249,18 +1356,18 @@ def weatherStatusCommand(childDevice){
   def deviceId = item[0]
   def deviceType = item[1]
   def deviceToken = item[2]
-	log.debug "Executing 'sendCommand.weatherStatusCommand'"
+	logDebug "Executing 'sendCommand.weatherStatusCommand'"
 	def result = sendCommand("weatherStatus",childDevice,[deviceId])
 }
 
 def getCapabilitiesCommand(childDevice, deviceDNI){
-	log.debug("childDevice is: " + childDevice.inspect())
-	log.debug("deviceDNI is: " + deviceDNI.inspect())
+	logDebug("childDevice is: " + childDevice.inspect())
+	logDebug("deviceDNI is: " + deviceDNI.inspect())
 	def item = deviceDNI.tokenize('|')
 	def deviceId = item[0]
 	def deviceType = item[1]
 	def deviceToken = item[2]
-	log.debug "Executing 'sendCommand.getcapabilities'"
+	logDebug "Executing 'sendCommand.getcapabilities'"
 	sendCommand("getcapabilities",childDevice,[deviceId])
 }
 
@@ -1275,24 +1382,27 @@ private removeChildDevices(delete) {
 }
 
 def parseCapabilityData(Map results){
-  log.debug "in parseCapabilityData"
+  logDebug "in parseCapabilityData"
   def result
   results.each { name, value ->
-    
+
     if (name == "value")
     {
-    log.debug "Map Name Returned, ${name} and Value is ${value}"
+    logDebug "Map Name Returned, ${name} and Value is ${value}"
     result = value.toString()
-    log.debug "Result is ${result}"
+    logDebug "Result is ${result}"
     //return result
     }
   }
   return result
 }
 
+
 //Device Commands Below Here
+
+
 def autoCommand(childDevice){
-  log.debug "Executing 'sendCommand.autoCommand' on device ${childDevice.device.name}"
+  logDebug "Executing 'sendCommand.autoCommand' on device ${childDevice.device.name}"
   def terminationmode = settings.manualmode
   def traperror
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
@@ -1305,12 +1415,12 @@ def autoCommand(childDevice){
     def capabilitySupportsAutoSwing = parseCapabilityData(childDevice.getCapabilitySupportsAutoSwing())
     def capabilitysupported = capabilitySupportsAuto
     if (capabilitysupported == "true"){
-    log.debug "Executing 'sendCommand.autoCommand' on device ${childDevice.device.name}"
+    log.info "Executing 'sendCommand.autoCommand' on device ${childDevice.device.name}"
     def jsonbody
    	if (capabilitySupportsAutoSwing == "true")
     {
         jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"AUTO", power:"ON", swing:"OFF", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-    } 
+    }
     else
     {
       	jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"AUTO", power:"ON", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
@@ -1318,7 +1428,7 @@ def autoCommand(childDevice){
     sendCommand("temperature",dchildDevice,[deviceId,jsonbody])
     statusCommand(device)
     } else {
-      log.debug("Sorry Auto Capability not supported on device ${childDevice.device.name}")
+      logDebug("Sorry Auto Capability not supported on device ${childDevice.device.name}")
     }
   }
   if(deviceType == "HEATING")
@@ -1330,8 +1440,8 @@ def autoCommand(childDevice){
     }
     else
     {
-       log.debug "Existing Setpoint is not set"
-       traperror = 0 
+       logDebug "Existing Setpoint is not set"
+       traperror = 0
     }
     if(traperror == 0){
       initialsetpointtemp = settings.defHeatingTemp
@@ -1344,7 +1454,7 @@ def autoCommand(childDevice){
   }
   if (deviceType == "HOT_WATER")
   {
-    log.debug "Executing 'sendCommand.autoCommand'"
+    logDebug "Executing 'sendCommand.autoCommand'"
     def initialsetpointtemp
     def jsonbody
     def capabilitySupportsWaterTempControl = parseCapabilityData(childDevice.getCapabilitySupportsWaterTempControl())
@@ -1355,8 +1465,8 @@ def autoCommand(childDevice){
     }
     else
     {
-       log.debug "Existing Setpoint is not set"
-       traperror = 0 
+       logDebug "Existing Setpoint is not set"
+       traperror = 0
     }
       if(traperror == 0){
         initialsetpointtemp = settings.defHeatingTemp
@@ -1382,12 +1492,12 @@ def dryCommand(childDevice){
   def capabilitysupported = capabilitySupportsDry
   if (capabilitysupported == "true"){
   	def terminationmode = settings.manualmode
-  	log.debug "Executing 'sendCommand.dryCommand' on device ${childDevice.device.name}"
+  	logDebug "Executing 'sendCommand.dryCommand' on device ${childDevice.device.name}"
   	def jsonbody
       	if (capabilitySupportsDrySwing == "true")
         {
 			jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"DRY", power:"ON", swing:"OFF", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        } 
+        }
         else
         {
         	jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"DRY", power:"ON", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
@@ -1395,7 +1505,7 @@ def dryCommand(childDevice){
   	sendCommand("temperature",childDevice,[deviceId,jsonbody])
   	statusCommand(childDevice)
   } else {
-    log.debug("Sorry Dry Capability not supported on device ${childDevice.device.name}")
+    logDebug("Sorry Dry Capability not supported on device ${childDevice.device.name}")
   }
 }
 
@@ -1409,26 +1519,26 @@ def fanAuto(childDevice){
   def capabilitysupported = capabilitySupportsFan
   if (capabilitysupported == "true"){
     def terminationmode = settings.manualmode
-		log.debug "Executing 'sendCommand.fanAutoCommand' on device ${childDevice.device.name}"
+		logDebug "Executing 'sendCommand.fanAutoCommand' on device ${childDevice.device.name}"
       def jsonbody
       	if (capabilitySupportsFanSwing == "true")
         {
 			jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"FAN", power:"ON", swing:"OFF", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        } 
+        }
         else
         {
         	jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"FAN", power:"ON", type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
         }
-    
+
     sendCommand("temperature",childDevice,[deviceId,jsonbody])
   	statusCommand(childDevice)
   } else {
-    log.debug("Sorry Fan Capability not supported by your HVAC Device")
+    logDebug("Sorry Fan Capability not supported by your HVAC Device")
   }
 }
 
 def endManualControl(childDevice){
-	log.debug "Executing 'sendCommand.endManualControl' on device ${childDevice.device.name}"
+	logDebug "Executing 'sendCommand.endManualControl' on device ${childDevice.device.name}"
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
   def deviceId = item[0]
   def deviceType = item[1]
@@ -1465,7 +1575,7 @@ def cmdFanSpeedAuto(childDevice){
     		else if(state.tempunit == "F"){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", swing:"OFF", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
-        } 
+        }
         else
         {
         	if (state.tempunit == "C") {
@@ -1475,7 +1585,7 @@ def cmdFanSpeedAuto(childDevice){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
         }
-		log.debug "Executing 'sendCommand.fanSpeedAuto' to ${supportedfanspeed}"
+		log.info "Executing 'sendCommand.fanSpeedAuto' to ${supportedfanspeed}"
     sendCommand("temperature",childDevice,[deviceId,jsonbody])
     statusCommand(childDevice)
 	}
@@ -1500,7 +1610,7 @@ def cmdFanSpeedHigh(childDevice){
     		else if(state.tempunit == "F"){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", swing:"OFF", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
-        } 
+        }
         else
         {
         	if (state.tempunit == "C") {
@@ -1510,7 +1620,7 @@ def cmdFanSpeedHigh(childDevice){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
         }
-		log.debug "Executing 'sendCommand.fanSpeedAuto' to ${supportedfanspeed}"
+		log.info "Executing 'sendCommand.fanSpeedAuto' to ${supportedfanspeed}"
     sendCommand("temperature",childDevice,[deviceId,jsonbody])
     statusCommand(childDevice)
 	}
@@ -1535,7 +1645,7 @@ def cmdFanSpeedMid(childDevice){
     		else if(state.tempunit == "F"){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", swing:"OFF", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
-        } 
+        }
         else
         {
         	if (state.tempunit == "C") {
@@ -1545,7 +1655,7 @@ def cmdFanSpeedMid(childDevice){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
         }
-		log.debug "Executing 'sendCommand.fanSpeedMid' to ${supportedfanspeed}"
+		log.info "Executing 'sendCommand.fanSpeedMid' to ${supportedfanspeed}"
 		sendCommand("temperature",childDevice,[deviceId,jsonbody])
     statusCommand(childDevice)
 	}
@@ -1572,7 +1682,7 @@ def cmdFanSpeedLow(childDevice){
     		else if(state.tempunit == "F"){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", swing:"OFF", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
-        } 
+        }
         else
         {
         	if (state.tempunit == "C") {
@@ -1582,7 +1692,7 @@ def cmdFanSpeedLow(childDevice){
       			jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:curMode, power:"ON", temperature:[fahrenheit:curSetTemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
     		}
         }
-		log.debug "Executing 'sendCommand.fanSpeedLow' to ${supportedfanspeed}"
+		log.info "Executing 'sendCommand.fanSpeedLow' to ${supportedfanspeed}"
 		sendCommand("temperature",childDevice,[deviceId,jsonbody])
     statusCommand(childDevice)
 	}
@@ -1614,7 +1724,7 @@ def setCoolingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"COOL", power:"ON", swing:"OFF", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else if(capabilitySupportsCoolSwing == "true" && capabilitySupportsCoolFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1622,7 +1732,7 @@ def setCoolingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"COOL", power:"ON", swing:"OFF", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else if(capabilitySupportsCoolSwing == "false" && capabilitySupportsCoolFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1630,7 +1740,7 @@ def setCoolingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"COOL", power:"ON", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else
     {
@@ -1639,10 +1749,10 @@ def setCoolingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
     		jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"COOL", power:"ON", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
 
-	log.debug "Executing 'sendCommand.setCoolingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
+	log.info "Executing 'sendCommand.setCoolingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
 	sendCommand("temperature",childDevice,[deviceId,jsonbody])
 }
 
@@ -1677,7 +1787,7 @@ def setHeatingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"HEAT", power:"ON", swing:"OFF", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else if(capabilitySupportsHeatSwing == "true" && capabilitySupportsHeatFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1685,7 +1795,7 @@ def setHeatingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", swing:"OFF", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else if(capabilitySupportsHeatSwing == "false" && capabilitySupportsHeatFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1693,7 +1803,7 @@ def setHeatingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else
     {
@@ -1702,9 +1812,9 @@ def setHeatingTempCommand(childDevice,targetTemperature){
   		}
   		else if(state.tempunit == "F"){
     		jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"HEAT", power:"ON", temperature:[fahrenheit:targetTemperature], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
-  	log.debug "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
+  	log.info "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
     sendCommand("temperature",childDevice,[deviceId,jsonbody])
   }
   if(deviceType == "HEATING")
@@ -1716,7 +1826,7 @@ def setHeatingTempCommand(childDevice,targetTemperature){
     else if(state.tempunit == "F"){
       jsonbody = new groovy.json.JsonOutput().toJson([setting:[power:"ON", temperature:[fahrenheit:targetTemperature], type:"HEATING"], termination:[type:terminationmode]])
     }
-    log.debug "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
+    log.info "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
     sendCommand("temperature",childDevice,[deviceId,jsonbody])
   }
   if(deviceType == "HOT_WATER")
@@ -1730,16 +1840,16 @@ def setHeatingTempCommand(childDevice,targetTemperature){
 			else if(state.tempunit == "F"){
 				jsonbody = new groovy.json.JsonOutput().toJson([setting:[power:"ON", temperature:[fahrenheit:targetTemperature], type:"HOT_WATER"], termination:[type:terminationmode]])
 			}
-		log.debug "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
+		log.info "Executing 'sendCommand.setHeatingTempCommand' to ${targetTemperature} on device ${childDevice.device.name}"
 		sendCommand("temperature",[jsonbody])
 	  } else {
-		    log.debug "Hot Water Temperature Capability Not Supported on device ${childDevice.device.name}"
+		    logDebug "Hot Water Temperature Capability Not Supported on device ${childDevice.device.name}"
 	  }
   }
 }
 
 def offCommand(childDevice){
-	log.debug "Executing 'sendCommand.offCommand' on device ${childDevice.device.name}"
+	log.info "Executing 'sendCommand.offCommand' on device ${childDevice.device.name}"
   def terminationmode = settings.manualmode
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
   def deviceId = item[0]
@@ -1750,7 +1860,7 @@ def offCommand(childDevice){
 }
 
 def onCommand(childDevice){
-  log.debug "Executing 'sendCommand.onCommand'"
+  log.info "Executing 'sendCommand.onCommand'"
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
   def deviceId = item[0]
   def deviceType = item[1]
@@ -1766,7 +1876,7 @@ def onCommand(childDevice){
 }
 
 def coolCommand(childDevice){
-	log.debug "Executing 'sendCommand.coolCommand'"
+	log.info "Executing 'sendCommand.coolCommand'"
     def terminationmode = settings.manualmode
     def item = (childDevice.device.deviceNetworkId).tokenize('|')
     def deviceId = item[0]
@@ -1787,8 +1897,8 @@ def coolCommand(childDevice){
     }
     else
     {
-       log.debug "Existing Setpoint is not set"
-       traperror = 0 
+       logDebug "Existing Setpoint is not set"
+       traperror = 0
     }
     if (fancapabilitysupported == "true"){
     	supportedfanspeed = "AUTO"
@@ -1808,7 +1918,7 @@ def coolCommand(childDevice){
     	}
     	else if (state.tempunit == "F"){
     		jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"COOL", power:"ON", swing:"OFF", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-    	}    
+    	}
     }
     else if(capabilitySupportsCoolSwing == "true" && capabilitySupportsCoolFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1816,7 +1926,7 @@ def coolCommand(childDevice){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"COOL", power:"ON", swing:"OFF", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else if(capabilitySupportsCoolSwing == "false" && capabilitySupportsCoolFanSpeed == "false"){
       if (state.tempunit == "C") {
@@ -1824,7 +1934,7 @@ def coolCommand(childDevice){
   		}
   		else if(state.tempunit == "F"){
             jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"COOL", power:"ON", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-  		}    
+  		}
     }
     else
     {
@@ -1839,7 +1949,7 @@ def coolCommand(childDevice){
 }
 
 def heatCommand(childDevice){
-  log.debug "Executing 'sendCommand.heatCommand' on device ${childDevice.device.name}"
+  log.info "Executing 'sendCommand.heatCommand' on device ${childDevice.device.name}"
   def terminationmode = settings.manualmode
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
   def deviceId = item[0]
@@ -1862,8 +1972,8 @@ def heatCommand(childDevice){
     	}
     	else
     	{
-       		log.debug "Existing Setpoint is not set"
-       		traperror = 0 
+       		logDebug "Existing Setpoint is not set"
+       		traperror = 0
     	}
       if (fancapabilitysupported == "true")
       {
@@ -1897,7 +2007,7 @@ def heatCommand(childDevice){
         }
         else if(state.tempunit == "F"){
               jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", swing:"OFF", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        }    
+        }
       }
       else if(capabilitySupportsHeatSwing == "false" && capabilitySupportsHeatFanSpeed == "false"){
         if (state.tempunit == "C") {
@@ -1905,8 +2015,8 @@ def heatCommand(childDevice){
         }
         else if(state.tempunit == "F"){
               jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        }    
-      } 
+        }
+      }
       else
       {
       	if (state.tempunit == "C") {
@@ -1914,9 +2024,9 @@ def heatCommand(childDevice){
       	}
       	else if (state.tempunit == "F"){
     		jsonbody = new groovy.json.JsonOutput().toJson([setting:[fanSpeed:supportedfanspeed, mode:"HEAT", power:"ON", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-      	}      
+      	}
       }
-      
+
       sendCommand("temperature",childDevice,[deviceId,jsonbody])
     }
     if(deviceType == "HEATING")
@@ -1929,8 +2039,8 @@ def heatCommand(childDevice){
     	}
     	else
     	{
-       		log.debug "Existing Setpoint is not set"
-       		traperror = 0 
+       		logDebug "Existing Setpoint is not set"
+       		traperror = 0
     	}
         if(traperror == 0)
         {
@@ -1962,8 +2072,8 @@ def heatCommand(childDevice){
     	}
     	else
     	{
-       		log.debug "Existing Setpoint is not set"
-       		traperror = 0 
+       		logDebug "Existing Setpoint is not set"
+       		traperror = 0
     	}
         if(traperror == 0){
           initialsetpointtemp = settings.defHeatingTemp
@@ -1984,7 +2094,7 @@ def heatCommand(childDevice){
 }
 
 def emergencyHeat(childDevice){
-  log.debug "Executing 'sendCommand.heatCommand' on device ${childDevice.device.name}"
+  log.info "Executing 'sendCommand.heatCommand' on device ${childDevice.device.name}"
   def traperror
   def item = (childDevice.device.deviceNetworkId).tokenize('|')
   def deviceId = item[0]
@@ -2004,8 +2114,8 @@ def emergencyHeat(childDevice){
     }
     else
     {
-       log.debug "Existing Setpoint is not set"
-       traperror = 0 
+       logDebug "Existing Setpoint is not set"
+       traperror = 0
     }
     if (capabilitysupported == "true")
     {
@@ -2043,7 +2153,7 @@ def emergencyHeat(childDevice){
         }
         else if(state.tempunit == "F"){
               jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", swing:"OFF", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        }    
+        }
       }
       else if(capabilitySupportsHeatSwing == "false" && capabilitySupportsHeatFanSpeed == "false"){
         if (state.tempunit == "C") {
@@ -2051,8 +2161,8 @@ def emergencyHeat(childDevice){
         }
         else if(state.tempunit == "F"){
               jsonbody = new groovy.json.JsonOutput().toJson([setting:[mode:"HEAT", power:"ON", temperature:[fahrenheit:initialsetpointtemp], type:"AIR_CONDITIONING"], termination:[type:terminationmode]])
-        }    
-      } 
+        }
+      }
       else
       {
 		if (state.tempunit == "C") {
@@ -2067,7 +2177,7 @@ def emergencyHeat(childDevice){
     }
     else
     {
-      log.debug("Sorry Heat Capability not supported on device ${childDevice.device.name}")
+      logDebug("Sorry Heat Capability not supported on device ${childDevice.device.name}")
     }
   }
   if(deviceType == "HEATING")
@@ -2079,8 +2189,8 @@ def emergencyHeat(childDevice){
     	}
     	else
     	{
-       		log.debug "Existing Setpoint is not set"
-       		traperror = 0 
+       		logDebug "Existing Setpoint is not set"
+       		traperror = 0
     	}
       if(traperror == 0)
       {
@@ -2112,8 +2222,8 @@ def emergencyHeat(childDevice){
     	}
     	else
     	{
-       		log.debug "Existing Setpoint is not set"
-       		traperror = 0 
+       		logDebug "Existing Setpoint is not set"
+       		traperror = 0
     	}
       if(traperror == 0)
       {
@@ -2144,14 +2254,125 @@ def statusCommand(childDevice){
   def deviceId = item[0]
   def deviceType = item[1]
   def deviceToken = item[2]
-	log.debug "Executing 'sendCommand.statusCommand'"
+	log.info "Executing status for: " + childDevice
 	sendCommand("status",childDevice,[deviceId])
 }
 
 def userStatusCommand(childDevice){
 	try{
-		log.debug "Executing 'sendCommand.userStatusCommand'"
+		log.info "Executing status for: " + childDevice
 		sendCommand("userStatus",childDevice,[])
-    	} catch(Exception e) { log.debug("Failed in setting userStatusCommand: " + e)
+    	} catch(Exception e) { logDebug("Failed in setting userStatusCommand: " + e)
     }
+}
+
+// -------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// OAuth methods
+// -------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+//mine
+def oauthAccessTokenGrant() {
+    log.info "Executing OAuth 2 Autorization Flow: Request Access Token"
+	def params = [
+		uri: getOauthTokenUri(),
+		path: getOauthTokenPath(),
+		body: [
+			client_id: getClientId(),
+			client_secret: getClientSecret(),
+			username: settings.username,
+			password: settings.password,
+			grant_type: "password"
+		]
+    ]
+	try {
+		logDebug "Parameters for PWD token request:" + " " + params
+		httpPost(params)
+		{ resp ->
+            logDebug "PWD Response data: " + resp.data
+            logDebug "PWD Response success: " + resp.success
+			if (resp && resp.data && resp.success) {
+				state.refreshToken = resp.data.refresh_token
+				logDebug "PWD Refresh token now : " + state.refreshToken
+				state.authToken = resp.data.access_token
+				logDebug "PWD Auth token now : " + state.authToken
+				state.authTokenExpires = (now() + (resp.data.expires_in * 1000)) - 60000
+				logDebug "Token expires:" + " " + state.authTokenExpires
+			} else { log.error "Failed to retreive access token" }
+		}
+	}
+	catch (e) {
+		log.error "OAuth error: ${e}"
+	}
+}
+
+def refreshToken() {
+	def result = false
+    log.info "Refreshing OAuth token"
+    //clear current auth token as we are going to try for a new one
+    logDebug "F5 auth token at the start is : " + state.authToken
+    state.authToken = ""
+    logDebug "F5 auth token now blanked : " + state.authToken
+    if (state.refreshToken == "" | state.refreshToken == null){
+        logDebug "Empty refresh token so using password"
+        oauthAccessTokenGrant()
+        return
+    }
+
+	try {
+        def params = [
+                uri: getOauthTokenUri(),
+                path: getOauthTokenPath(),
+				body: [
+                    client_id: getClientId(),
+                    client_secret: getClientSecret(),
+                    refresh_token: getRefreshToken(),
+                    grant_type: "refresh_token"
+				]
+        ]
+        logDebug "Parameters for token refresh:" + " " + params
+
+		httpPost(params) { resp ->
+            logDebug "F5 Response data:" + " " + resp.data
+            logDebug "F5 Response succes:" + " " + resp.success
+			if (resp && resp.data && resp.success) {
+                state.refreshToken = resp.data.refresh_token
+                logDebug "F5 Refresh token now: " +  state.refreshToken
+                state.authToken = resp.data.access_token
+                logDebug "F5 Access token now: " +  state.authToken
+                state.authTokenExpires = now() + (resp.data.expires_in * 1000) - 60000
+                logDebug "F5 Token expires:" + " " + state.authTokenExpires
+				result = true
+			}
+		}
+        if (state.authToken == "" | state.authToken == null) {
+            log.error "Failed to refresh token"
+            //attempt to get new token using original creds
+            oauthAccessTokenGrant()
+            if (state.authToken == "") {
+                result = false
+            } else {
+                result = true
+            }
+        } else {
+            result = true
+        }
+	} catch (e) {
+		log.error "Failed to refresh token: ${e}"
+		state.authToken = ""
+		//attempt to get new token using original creds
+		oauthAccessTokenGrant()
+		if (state.authToken == "" | state.authToken == null) {
+			result = true
+		} else {
+			result = false
+		}
+	}
+	//return result
+    logDebug "F5 auth token at end is : " + state.authToken
+}
+
+def logDebug(message) {
+	if (debugLogging == true){
+		log.debug message
+	}
 }
