@@ -331,7 +331,7 @@ def getDeviceList() {
 
 def getUserList() {
   def TadoUsers = getMobileDevicesCommand()
-  if (TadoUser != null) {
+  if (TadoUsers != null) {
 	return TadoUsers.sort()
   }
 }
