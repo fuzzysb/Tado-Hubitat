@@ -12,6 +12,7 @@
  *  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License
  *  for the specific language governing permissions and limitations under the License.
  *
+ * 22/02/2024 v2.9.1 Corrected Typo in UserList processing
  * 22/11/2023 v2.9 Adjusted to OAuth 2 authentication flow & update to logging process including toggle
  * 27/04/2018 v2.8 fixed issue with null values when trying to retrieve current setpoint when null as the try and catch arent working as expected.
  * 27/04/2018 v2.7 Modified for Hubitat
